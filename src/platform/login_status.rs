@@ -88,7 +88,7 @@ fn unix_lock_probe(db_dir: &Path) -> (bool, Option<u32>) {
         if rc != 0 {
             return (false, None);
         }
-        let logged_in = i32::from(fl.l_type) != libc::F_UNLCK;
+        let logged_in = fl.l_type != libc::F_UNLCK as _;
         let pid = if logged_in && fl.l_pid > 0 {
             Some(fl.l_pid as u32)
         } else {
