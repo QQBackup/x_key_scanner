@@ -123,7 +123,7 @@ pub fn scan<A: ProcessAccess + Sync>(access: &A) -> std::io::Result<Vec<Candidat
 
     let mut cands: Vec<Candidate> =
         counts.into_iter().map(|(key, count)| Candidate { key, count }).collect();
-    cands.sort_by(|a, b| b.count.cmp(&a.count));
+    cands.sort_by_key(|c| std::cmp::Reverse(c.count));
     Ok(cands)
 }
 
