@@ -73,6 +73,7 @@ unsafe extern "C" {
         buffer: *mut libc::c_void,
         buffersize: u32,
     ) -> libc::c_int;
+    fn proc_pidpath(pid: libc::c_int, buffer: *mut libc::c_void, buffersize: u32) -> libc::c_int;
 }
 
 // --- mach FFI (only for reading memory; needs root) ------------------------
@@ -142,6 +143,21 @@ fn region_path(pid: libc::c_int, address: u64) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
+/// The executable path of `pid` (one cheap syscall). Used to skip the expensive
+/// per-region path lookups for processes that clearly aren't QQ.
+fn pid_path(pid: libc::c_int) -> Option<String> {
+    let mut buf = vec![0u8; MAXPATHLEN];
+    // SAFETY: buffer is MAXPATHLEN bytes; return value is the path length.
+    let n = unsafe {
+        proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, MAXPATHLEN as u32)
+    };
+    if n <= 0 {
+        return None;
+    }
+    buf.truncate(n as usize);
+    String::from_utf8(buf).ok()
+}
+
 /// Enumerate PIDs that have `wrapper.node` mapped.
 pub fn find_wrapper_node_pids() -> io::Result<Vec<u32>> {
     // First pass: how many pids? proc_listpids with a null buffer returns the
@@ -174,6 +190,14 @@ pub fn find_wrapper_node_pids() -> io::Result<Vec<u32>> {
     for &pid in &pids {
         if pid <= 0 {
             continue;
+        }
+        // Cheap pre-filter: one proc_pidpath call rules out the hundreds of
+        // unrelated processes before we do the expensive per-region path walk.
+        // wrapper.node only ever loads inside a QQ process, whose executable
+        // path contains "QQ" (…/QQ.app/Contents/MacOS/QQ and its helpers).
+        match pid_path(pid) {
+            Some(p) if p.contains("QQ") => {}
+            _ => continue,
         }
         let mut found = false;
         for (addr, _size, _prot) in walk_regions(pid) {

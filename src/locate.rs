@@ -23,6 +23,30 @@ pub fn login_db_path(root: &Path) -> PathBuf {
     }
 }
 
+/// Candidate locations for the global login.db, most-preferred first.
+///
+/// On Linux the file has been seen in two layouts: the usual
+/// `global/nt_db/login.db`, and — on some installs — nested under `nt_qq/`
+/// like Windows. We return both so the caller can read and merge them,
+/// preferring the primary ([`login_db_path`]) on conflict. Other platforms
+/// have a single canonical location.
+pub fn login_db_candidates(root: &Path) -> Vec<PathBuf> {
+    let primary = login_db_path(root);
+    #[cfg(target_os = "linux")]
+    {
+        let alt = root.join("nt_qq").join("global").join("nt_db").join("login.db");
+        if alt == primary {
+            vec![primary]
+        } else {
+            vec![primary, alt]
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        vec![primary]
+    }
+}
+
 /// The per-account `nt_db` directory holding settings.db, nt_msg.db, etc.
 ///   * Windows: `<root>/<uin>/nt_qq/nt_db`
 ///   * Unix:    `<root>/nt_qq_<hash>/nt_db`, hash = md5(md5(uid) + "nt_kernel")
@@ -138,10 +162,11 @@ fn linux_config_qq() -> Option<PathBuf> {
     direct
 }
 
-/// Whether `root` is a populated QQ data root, i.e. it holds the login database.
+/// Whether `root` is a populated QQ data root, i.e. it holds the login database
+/// in either known layout.
 #[cfg(target_os = "linux")]
 fn has_login_db(root: &Path) -> bool {
-    login_db_path(root).exists()
+    login_db_candidates(root).iter().any(|p| p.exists())
 }
 
 /// `$SUDO_USER`'s `~/.config/QQ`, if it holds a login.db.

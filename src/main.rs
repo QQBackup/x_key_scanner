@@ -99,8 +99,15 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
     ui::field("主进程 PID", &pid.to_string());
 
     // --- Step 3: login.db -> accounts ---------------------------------------
-    let login_db = locate::login_db_path(&root);
-    let (accounts, login_algo) = login_db::read_accounts(&login_db).map_err(|e| {
+    let login_candidates = locate::login_db_candidates(&root);
+    // For decryption later we need a concrete file; prefer the first candidate
+    // that exists, falling back to the primary path for the error message.
+    let login_db = login_candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .unwrap_or_else(|| login_candidates[0].clone());
+    let (accounts, login_algo) = login_db::read_accounts_merged(&login_candidates).map_err(|e| {
         io::Error::new(e.kind(), format!("reading {}: {e}", login_db.display()))
     })?;
     if accounts.is_empty() {

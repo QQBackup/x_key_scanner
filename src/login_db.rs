@@ -11,7 +11,7 @@
 //!   "1000" = uin, "1001" = uid, "1007" = user_name (nick).
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -46,6 +46,44 @@ pub fn read_accounts(path: &Path) -> io::Result<(Vec<Account>, Algo)> {
 
     let accounts = query_login_table(&plain)?;
     Ok((accounts, verified.algo))
+}
+
+/// Read and merge accounts from several candidate `login.db` locations.
+///
+/// Some Linux installs keep login.db in a second, Windows-like layout. We read
+/// every candidate that exists and merge their accounts, keeping earlier paths
+/// authoritative on conflict (same uin). The algorithm is taken from the first
+/// path that decrypts. Missing/undecryptable candidates are skipped; an error is
+/// only returned if none yield anything.
+pub fn read_accounts_merged(paths: &[PathBuf]) -> io::Result<(Vec<Account>, Algo)> {
+    let mut merged: Vec<Account> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut algo: Option<Algo> = None;
+    let mut last_err: Option<io::Error> = None;
+
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        match read_accounts(path) {
+            Ok((accounts, a)) => {
+                algo.get_or_insert(a);
+                for acc in accounts {
+                    if seen.insert(acc.uin.clone()) {
+                        merged.push(acc);
+                    }
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+
+    match algo {
+        Some(a) => Ok((merged, a)),
+        None => Err(last_err.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "no login.db candidate could be read")
+        })),
+    }
 }
 
 /// Write the plaintext SQLite image to a temp file and read `login_table`.
