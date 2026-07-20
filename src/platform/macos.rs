@@ -149,8 +149,7 @@ pub fn find_wrapper_node_pids() -> io::Result<Vec<u32>> {
     // SAFETY: null buffer / 0 size is the documented "size query" form.
     let cap = unsafe { proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
     if cap <= 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "proc_listpids returned no pids (are you running as root?)",
         ));
     }
@@ -190,11 +189,6 @@ pub fn find_wrapper_node_pids() -> io::Result<Vec<u32>> {
         }
     }
     Ok(matched)
-}
-
-pub fn is_elevated() -> bool {
-    // SAFETY: geteuid is always safe.
-    unsafe { libc::geteuid() == 0 }
 }
 
 pub struct PlatformAccess {
@@ -240,8 +234,7 @@ impl ProcessAccess for PlatformAccess {
             mach_vm_read(self.task, addr as u64, len as u64, &mut data, &mut data_count)
         };
         if kr != KERN_SUCCESS {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("mach_vm_read failed at {addr:#x} (kern_return {kr})"),
             ));
         }
