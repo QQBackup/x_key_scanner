@@ -110,22 +110,24 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 /// Resolve `~/.config/QQ`, tolerating `sudo`. Under sudo `$HOME` is `/root`,
-/// which has no QQ data, so if the direct path is missing we fall back to the
-/// invoking user's real home: first `$SUDO_USER`'s home, then any `/home/*` that
-/// actually has a `.config/QQ`. We warn when falling back so the user knows we
+/// whose `.config/QQ` either doesn't exist or is an empty/stale shell with no
+/// `login.db`. So we don't trust a bare directory — we require it to actually
+/// hold `global/nt_db/login.db`. If the direct path fails that test we fall back
+/// to the invoking user's real home: first `$SUDO_USER`'s, then any `/home/*`
+/// with a populated QQ dir. We warn when falling back so the user knows we
 /// crossed into another account's directory.
 #[cfg(target_os = "linux")]
 fn linux_config_qq() -> Option<PathBuf> {
     let direct = home_dir().map(|h| h.join(".config").join("QQ"));
     if let Some(p) = &direct {
-        if p.exists() {
+        if has_login_db(p) {
             return Some(p.clone());
         }
     }
 
     if let Some(p) = sudo_user_config_qq().or_else(scan_home_config_qq) {
         crate::ui::warn(&format!(
-            "当前 HOME 下未找到 .config/QQ（可能是 sudo 运行）；改用 {} 。",
+            "当前 HOME 下的 .config/QQ 无 login.db（可能是 sudo 运行）；改用 {} 。",
             p.display()
         ));
         return Some(p);
@@ -136,7 +138,13 @@ fn linux_config_qq() -> Option<PathBuf> {
     direct
 }
 
-/// `$SUDO_USER`'s `~/.config/QQ`, resolved via the passwd database, if present.
+/// Whether `root` is a populated QQ data root, i.e. it holds the login database.
+#[cfg(target_os = "linux")]
+fn has_login_db(root: &Path) -> bool {
+    login_db_path(root).exists()
+}
+
+/// `$SUDO_USER`'s `~/.config/QQ`, if it holds a login.db.
 #[cfg(target_os = "linux")]
 fn sudo_user_config_qq() -> Option<PathBuf> {
     let user = std::env::var_os("SUDO_USER")?;
@@ -145,15 +153,15 @@ fn sudo_user_config_qq() -> Option<PathBuf> {
         return None;
     }
     let candidate = PathBuf::from("/home").join(user).join(".config").join("QQ");
-    candidate.exists().then_some(candidate)
+    has_login_db(&candidate).then_some(candidate)
 }
 
-/// Scan `/home/*/.config/QQ` and return the first that exists.
+/// Scan `/home/*/.config/QQ` and return the first that holds a login.db.
 #[cfg(target_os = "linux")]
 fn scan_home_config_qq() -> Option<PathBuf> {
     for entry in std::fs::read_dir("/home").ok()?.flatten() {
         let candidate = entry.path().join(".config").join("QQ");
-        if candidate.exists() {
+        if has_login_db(&candidate) {
             return Some(candidate);
         }
     }
