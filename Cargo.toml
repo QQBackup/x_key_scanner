@@ -1,0 +1,63 @@
+[package]
+name = "x_key_scanner"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Non-invasively recover the NTQQ master key from a logged-in QQ process by scanning its memory."
+
+[[bin]]
+name = "x_key_scanner"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Pure-Rust crypto (RustCrypto) — NO openssl, NO rusqlite. This is the whole
+# point: QQ NT databases are SQLCipher v4 streams, but we decrypt pages by hand
+# so we never pull in a bundled sqlcipher/openssl (which dominated CI time).
+sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+aes = "0.8"
+cbc = "0.1"
+md-5 = "0.10"
+hex = "0.4"
+
+# Read the DECRYPTED (plaintext) login.db. We use plain `bundled` SQLite only —
+# NOT bundled-sqlcipher — so this compiles the single-file SQLite amalgamation
+# in seconds and pulls in NO openssl. QQ's encryption is stripped by our own
+# hand-written AES page decryption before rusqlite ever sees the file.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Multi-core memory scan + parallel page decryption to shrink the window during
+# which a live QQ can hand us a torn/corrupt page.
+rayon = "1"
+
+# Colored TUI output (no heavy unicode/emoji — plain ANSI styling only).
+anstream = "0.6"
+anstyle = "1"
+
+# Progress bar for the database-decryption step. Pure Rust, no openssl.
+indicatif = "0.17"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Memory",
+    "Win32_Security",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true

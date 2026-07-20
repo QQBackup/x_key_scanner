@@ -1,0 +1,9 @@
+/target
+.idea/
+.vs/
+.vscode/
+
+# vibe coding 套装
+.claude/
+.codex/
+.agent/

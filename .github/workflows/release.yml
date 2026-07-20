@@ -1,0 +1,129 @@
+name: release
+
+# Build all six targets and attach binaries to a GitHub Release.
+#
+# Why this shape:
+#   * NO openssl anywhere. rusqlite uses the plain `bundled` SQLite amalgamation
+#     (a single C file), so the only native-build requirement per target is a C
+#     compiler — seconds, not the 15-minute openssl slog that sqlcipher caused.
+#   * arm64 targets are cross-compiled and NOT tested (runners have no arm HW).
+#     x64 targets build + test natively.
+#   * macOS: one arm64 runner produces both apple-darwin arches (Apple's
+#     toolchain cross-compiles x86_64<->aarch64 natively, and cc finds the SDK).
+#   * Linux arm64 uses `cross` (Docker) so the bundled SQLite C file gets an
+#     aarch64 cross toolchain without hand-wiring one.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+            test: true
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+            test: false
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+            test: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+            test: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+            test: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+            test: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Windows ARM64: the default MSVC dev shell targets x64. Point the build
+      # at the ARM64 cross tools so cc/link find the right cl.exe + libs.
+      - name: Set up MSVC (Windows ARM64)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_arm64
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Test (x64 only)
+        if: matrix.test
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          bin="x_key_scanner"
+          out="x_key_scanner-${{ matrix.target }}"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/${bin}.exe" "${out}.exe"
+          else
+            cp "target/${{ matrix.target }}/release/${bin}" "${out}"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: x_key_scanner-${{ matrix.target }}
+          path: x_key_scanner-${{ matrix.target }}*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
