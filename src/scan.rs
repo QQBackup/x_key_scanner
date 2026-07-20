@@ -62,17 +62,14 @@ fn key_ok(win: &[u8]) -> bool {
 /// python `data[off+1:off+11] == FIXED`): the `\x09` length-prefix sits at
 /// `off+1`, so "HMAC_SHA1" itself is what lands on the aligned boundary + 2.
 /// Returns the aligned slot `off` (used as the search center for `nearest_key`).
+///
+/// The anchor is rare, so we let memchr's SIMD substring search jump straight to
+/// each occurrence instead of testing every 16-byte slot; a hit at `p` maps to
+/// the aligned slot `p - 1`, kept only when that slot is ALIGN-aligned.
 fn find_anchors(data: &[u8]) -> Vec<usize> {
-    let mut out = Vec::new();
-    let n = data.len();
-    let mut off = 0;
-    while off + 1 + ANCHOR.len() <= n {
-        if data[off + 1..off + 1 + ANCHOR.len()] == *ANCHOR {
-            out.push(off);
-        }
-        off += ALIGN;
-    }
-    out
+    memchr::memmem::find_iter(data, ANCHOR)
+        .filter_map(|p| p.checked_sub(1).filter(|off| off % ALIGN == 0))
+        .collect()
 }
 
 /// Nearest aligned key window to `anchor`, searching outward in ALIGN steps up
@@ -185,12 +182,12 @@ pub fn scan<A: ProcessAccess + Sync>(access: &A) -> std::io::Result<Vec<Candidat
                 Ok(d) => d,
                 Err(_) => return Vec::new(), // unreadable region: skip, not fatal
             };
-            // Quick reject: no anchor substring at all.
-            if !contains_subslice(&data, ANCHOR) {
+            // Quick reject: no anchor at all (memmem's SIMD scan returns empty).
+            let anchors = find_anchors(&data);
+            if anchors.is_empty() {
                 return Vec::new();
             }
             let mut found = Vec::new();
-            let anchors = find_anchors(&data);
             // Native path: key sits beside a single anchor.
             for &anchor in &anchors {
                 if let Some(k) = nearest_key(&data, anchor) {
@@ -216,11 +213,106 @@ pub fn scan<A: ProcessAccess + Sync>(access: &A) -> std::io::Result<Vec<Candidat
     Ok(cands)
 }
 
-/// Naive substring search (regions are large but anchors are rare; this is only
-/// a fast pre-filter before the aligned scan).
-fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return false;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::MemRegion;
+
+    /// In-memory fake process backed by a single byte buffer at `base`.
+    struct FakeAccess {
+        base: usize,
+        data: Vec<u8>,
     }
-    haystack.windows(needle.len()).any(|w| w == needle)
+
+    impl ProcessAccess for FakeAccess {
+        fn open(_pid: u32) -> std::io::Result<Self> {
+            unreachable!("FakeAccess is constructed directly in tests")
+        }
+        fn regions(&self) -> std::io::Result<Vec<MemRegion>> {
+            Ok(vec![MemRegion { base: self.base, size: self.data.len() }])
+        }
+        fn read(&self, addr: usize, len: usize) -> std::io::Result<Vec<u8>> {
+            let off = addr - self.base;
+            Ok(self.data[off..(off + len).min(self.data.len())].to_vec())
+        }
+    }
+
+    /// Write the length-prefixed `\x09HMAC_SHA1` marker so its aligned slot passes
+    /// `find_anchors` (which matches the anchor at slot+1).
+    fn put_anchor(buf: &mut [u8], slot: usize) {
+        buf[slot] = 0x00; // any non-anchor byte; the `\x09` prefix lands at slot+1
+        buf[slot + 1..slot + 1 + ANCHOR.len()].copy_from_slice(ANCHOR);
+    }
+
+    #[test]
+    fn native_layout_key_beside_single_anchor() {
+        // Key within RADIUS of one anchor — the original per-anchor path. Fill with
+        // 0x00 (non-printable) so the only key_ok window is the one we plant.
+        let mut buf = vec![0x00u8; 0x1000];
+        let anchor = 0x800;
+        put_anchor(&mut buf, anchor);
+        let key = *b"nativeKEY!@#$%^&"; // 16 bytes, printable, not all-alnum
+        buf[anchor + 0x100..anchor + 0x100 + KEY_LEN].copy_from_slice(&key);
+
+        let acc = FakeAccess { base: 0x10000, data: buf };
+        let cands = scan(&acc).unwrap();
+        assert!(cands.iter().any(|c| c.key == key), "native key must be found");
+    }
+
+    #[test]
+    fn electron_layout_key_near_cluster_center_only() {
+        // Reproduce the Linux/Electron shape and prove the cluster path is doing the
+        // work: BOTH the real key and the decoy sit farther than RADIUS from every
+        // anchor, so the per-anchor path finds neither. The real key is near the
+        // dense cluster's center (reachable by cluster_keys); the decoy hugs a lone
+        // stray anchor whose size-1 cluster is filtered by MIN_CLUSTER_ANCHORS and
+        // lies beyond CLUSTER_MAX_OUT of the real cluster — so it must never appear.
+        let mut buf = vec![0x00u8; 0x50000];
+
+        // Dense cluster: anchors spaced 0x200 (< CLUSTER_GAP) near the start.
+        let cluster_start = 0x2000;
+        let n_anchors = MIN_CLUSTER_ANCHORS + 4;
+        for i in 0..n_anchors {
+            put_anchor(&mut buf, cluster_start + i * 0x200);
+        }
+        let cluster_end = cluster_start + (n_anchors - 1) * 0x200;
+
+        // Real key: just past the cluster's high end, RADIUS*2 from the nearest
+        // anchor (so the per-anchor path can't reach it) but well within
+        // CLUSTER_MAX_OUT of the center (so cluster_keys can).
+        let real = *b"gWDxEK)azQqFNBD<"; // 16 bytes, printable, not all-alnum
+        let key_pos = cluster_end + 2 * RADIUS;
+        buf[key_pos..key_pos + KEY_LEN].copy_from_slice(&real);
+
+        // Lone stray anchor with a decoy key 2*RADIUS away: unreachable by the
+        // per-anchor path, its cluster too small to trust, and beyond the real
+        // cluster's outward reach.
+        let stray = 0x40000;
+        put_anchor(&mut buf, stray);
+        let decoy = *b"decoyKEY{}|~<>?/";
+        let decoy_pos = stray + 2 * RADIUS;
+        buf[decoy_pos..decoy_pos + KEY_LEN].copy_from_slice(&decoy);
+
+        let acc = FakeAccess { base: 0x100000, data: buf };
+        let cands = scan(&acc).unwrap();
+
+        assert!(
+            cands.iter().any(|c| c.key == real),
+            "cluster-center path must recover the Electron key"
+        );
+        assert!(
+            !cands.iter().any(|c| c.key == decoy),
+            "stray single-anchor cluster must be ignored (decoy leaked)"
+        );
+    }
+
+    #[test]
+    fn cluster_split_respects_gap() {
+        // Two anchor groups separated by more than CLUSTER_GAP form two clusters.
+        let anchors = vec![0x1000, 0x1200, 0x1400, 0x1000 + CLUSTER_GAP + 0x8000];
+        let clusters = cluster_anchors(&anchors);
+        assert_eq!(clusters.len(), 2);
+        assert_eq!(clusters[0].len(), 3);
+        assert_eq!(clusters[1].len(), 1);
+    }
 }

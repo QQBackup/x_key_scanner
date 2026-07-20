@@ -57,7 +57,7 @@ pub fn detect_data_root() -> Option<PathBuf> {
     }
     #[cfg(target_os = "linux")]
     {
-        Some(home_dir()?.join(".config").join("QQ"))
+        linux_config_qq()
     }
     #[cfg(target_os = "macos")]
     {
@@ -107,4 +107,55 @@ fn detect_windows_root() -> Option<PathBuf> {
 #[cfg(unix)]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Resolve `~/.config/QQ`, tolerating `sudo`. Under sudo `$HOME` is `/root`,
+/// which has no QQ data, so if the direct path is missing we fall back to the
+/// invoking user's real home: first `$SUDO_USER`'s home, then any `/home/*` that
+/// actually has a `.config/QQ`. We warn when falling back so the user knows we
+/// crossed into another account's directory.
+#[cfg(target_os = "linux")]
+fn linux_config_qq() -> Option<PathBuf> {
+    let direct = home_dir().map(|h| h.join(".config").join("QQ"));
+    if let Some(p) = &direct {
+        if p.exists() {
+            return Some(p.clone());
+        }
+    }
+
+    if let Some(p) = sudo_user_config_qq().or_else(scan_home_config_qq) {
+        crate::ui::warn(&format!(
+            "当前 HOME 下未找到 .config/QQ（可能是 sudo 运行）；改用 {} 。",
+            p.display()
+        ));
+        return Some(p);
+    }
+
+    // Nothing better found; hand back the direct guess so the caller's existing
+    // "detected path doesn't exist" flow can prompt for manual input.
+    direct
+}
+
+/// `$SUDO_USER`'s `~/.config/QQ`, resolved via the passwd database, if present.
+#[cfg(target_os = "linux")]
+fn sudo_user_config_qq() -> Option<PathBuf> {
+    let user = std::env::var_os("SUDO_USER")?;
+    let user = user.to_str()?;
+    if user.is_empty() || user == "root" {
+        return None;
+    }
+    let candidate = PathBuf::from("/home").join(user).join(".config").join("QQ");
+    candidate.exists().then_some(candidate)
+}
+
+/// Scan `/home/*/.config/QQ` and return the first that exists.
+#[cfg(target_os = "linux")]
+fn scan_home_config_qq() -> Option<PathBuf> {
+    for entry in std::fs::read_dir("/home").ok()?.flatten() {
+        let candidate = entry.path().join(".config").join("QQ");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }

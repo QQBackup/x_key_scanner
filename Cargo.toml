@@ -35,6 +35,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # which a live QQ can hand us a torn/corrupt page.
 rayon = "1"
 
+# SIMD substring search for the HMAC_SHA1 anchor. Replaces a byte-by-byte
+# windows() scan over each (up to 512MB) region — the scan's hot path.
+memchr = "2"
+
 # Colored TUI output (no heavy unicode/emoji — plain ANSI styling only).
 anstream = "0.6"
 anstyle = "1"
