@@ -40,22 +40,47 @@ const CLUSTER_GAP: usize = 0x4000;
 const MIN_CLUSTER_ANCHORS: usize = 4;
 /// How far to walk outward from a cluster center before giving up.
 const CLUSTER_MAX_OUT: usize = 0x20000;
-/// Collect at most this many key candidates per cluster (the nearest few).
-const CLUSTER_KEYS_PER: usize = 4;
+/// Collect at most this many key candidates per cluster.
+///
+/// Linux/Electron heaps can place a large certificate-string table between the
+/// codec cluster center and the live key. Current QQ builds have been observed
+/// with more than 150 distinct printable 16-byte windows before the key, so a
+/// tiny "nearest few" cap truncates the search before verification can see it.
+const CLUSTER_KEYS_PER: usize = 256;
 
-fn is_printable(b: u8) -> bool {
-    (0x20..0x7f).contains(&b)
+fn is_non_space_printable(b: u8) -> bool {
+    (0x21..0x7f).contains(&b)
 }
+
 fn is_alnum(b: u8) -> bool {
     b.is_ascii_alphanumeric()
 }
 
 /// A 16-byte window qualifies as a key candidate iff every byte is printable and
-/// they are not *all* alphanumeric (ordinary text is rejected).
+/// non-space, and they are not *all* alphanumeric (ordinary text is rejected).
 fn key_ok(win: &[u8]) -> bool {
     win.len() == KEY_LEN
-        && win.iter().all(|&b| is_printable(b))
+        && win.iter().all(|&b| is_non_space_printable(b))
         && !win.iter().all(|&b| is_alnum(b))
+}
+
+/// Count how many character classes occur: digit, uppercase, lowercase, symbol.
+fn character_class_count(key: &[u8; KEY_LEN]) -> u8 {
+    let mut classes = 0;
+    classes += u8::from(key.iter().any(u8::is_ascii_digit));
+    classes += u8::from(key.iter().any(u8::is_ascii_uppercase));
+    classes += u8::from(key.iter().any(u8::is_ascii_lowercase));
+    classes += u8::from(key.iter().any(|b| !b.is_ascii_alphanumeric()));
+    classes
+}
+
+fn sort_candidates(candidates: &mut [Candidate]) {
+    candidates.sort_by(|a, b| {
+        character_class_count(&b.key)
+            .cmp(&character_class_count(&a.key))
+            .then_with(|| b.count.cmp(&a.count))
+            .then_with(|| a.key.cmp(&b.key))
+    });
 }
 
 /// Find 16-byte-aligned slots whose *next* byte begins the anchor (matching the
@@ -168,8 +193,8 @@ pub struct Candidate {
     pub count: usize,
 }
 
-/// Scan the process's readable regions for raw_key candidates, ranked by how
-/// often each was found (most frequent first).
+/// Scan the process's readable regions for raw_key candidates. Candidates with
+/// more character classes rank first, then more frequently observed candidates.
 pub fn scan<A: ProcessAccess + Sync>(access: &A) -> std::io::Result<Vec<Candidate>> {
     let regions = access.regions()?;
 
@@ -209,7 +234,7 @@ pub fn scan<A: ProcessAccess + Sync>(access: &A) -> std::io::Result<Vec<Candidat
 
     let mut cands: Vec<Candidate> =
         counts.into_iter().map(|(key, count)| Candidate { key, count }).collect();
-    cands.sort_by_key(|c| std::cmp::Reverse(c.count));
+    sort_candidates(&mut cands);
     Ok(cands)
 }
 
@@ -307,6 +332,40 @@ mod tests {
     }
 
     #[test]
+    fn electron_layout_searches_past_many_printable_decoys() {
+        let mut buf = vec![0x00u8; 0x50000];
+        let cluster_start = 0x18000;
+        let n_anchors = MIN_CLUSTER_ANCHORS + 12;
+        for i in 0..n_anchors {
+            put_anchor(&mut buf, cluster_start + i * 0x200);
+        }
+
+        let cluster_end = cluster_start + (n_anchors - 1) * 0x200;
+        let center = ((cluster_start + cluster_end) / 2 / ALIGN) * ALIGN;
+
+        // Reproduce a certificate/string-table-heavy Electron heap with enough
+        // nearer key-like windows to exceed the previous cap by a wide margin.
+        for i in 1..=151 {
+            let off = center + i * 0x100;
+            let decoy = format!("cert-table-{i:05}");
+            assert_eq!(decoy.len(), KEY_LEN);
+            buf[off..off + KEY_LEN].copy_from_slice(decoy.as_bytes());
+        }
+
+        let key = *b"realKEY)abcDEF!<";
+        let key_off = center + 152 * 0x100;
+        assert!(key_off.abs_diff(center) <= CLUSTER_MAX_OUT);
+        buf[key_off..key_off + KEY_LEN].copy_from_slice(&key);
+
+        let acc = FakeAccess { base: 0x10000, data: buf };
+        let cands = scan(&acc).unwrap();
+        assert!(
+            cands.iter().any(|c| c.key == key),
+            "cluster search must continue past large printable string tables"
+        );
+    }
+
+    #[test]
     fn cluster_split_respects_gap() {
         // Two anchor groups separated by more than CLUSTER_GAP form two clusters.
         let anchors = vec![0x1000, 0x1200, 0x1400, 0x1000 + CLUSTER_GAP + 0x8000];
@@ -314,5 +373,29 @@ mod tests {
         assert_eq!(clusters.len(), 2);
         assert_eq!(clusters[0].len(), 3);
         assert_eq!(clusters[1].len(), 1);
+    }
+
+    #[test]
+    fn key_candidates_reject_spaces() {
+        assert!(key_ok(b"Abcdef1234567!@#"));
+        assert!(!key_ok(b"Abcdef 123456!@#"));
+    }
+
+    #[test]
+    fn candidate_order_prefers_more_character_classes() {
+        let mut cands = vec![
+            Candidate { key: *b"!!!!!!!!!!!!!!!?", count: 99 },
+            Candidate { key: *b"ABCDEF1234567!@#", count: 10 },
+            Candidate { key: *b"Abcdef1234567!@#", count: 1 },
+            Candidate { key: *b"abcdef1234567!@#", count: 20 },
+            Candidate { key: *b"abcdefghijklmno!", count: 50 },
+        ];
+
+        sort_candidates(&mut cands);
+
+        let class_counts: Vec<u8> =
+            cands.iter().map(|candidate| character_class_count(&candidate.key)).collect();
+        assert_eq!(class_counts, vec![4, 3, 3, 2, 1]);
+        assert_eq!(cands[1].count, 20, "frequency breaks equal-class ties");
     }
 }

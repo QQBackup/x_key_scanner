@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
+use rayon::prelude::*;
 
 use crypto::{Algo, decrypt_database, detect_algo};
 use login_db::Account;
@@ -270,19 +271,17 @@ fn pick_logged_in<'a>(
 }
 
 /// Try each raw_key candidate against settings.db, brute-forcing the algorithm
-/// pair. Returns the first that decrypts, with its algorithm.
+/// pair. Candidate checks run in parallel, while `find_map_first` preserves the
+/// scanner's character-class and frequency priority.
 fn verify_against_settings(
     settings_db: &Path,
     candidates: &[scan::Candidate],
 ) -> Option<(scan::Candidate, Algo)> {
     let bytes = std::fs::read(settings_db).ok()?;
-    for cand in candidates {
+    candidates.par_iter().find_map_first(|cand| {
         let pass = hex_passphrase(&cand.key);
-        if let Some(v) = detect_algo(&bytes, &pass) {
-            return Some((cand.clone(), v.algo));
-        }
-    }
-    None
+        detect_algo(&bytes, &pass).map(|verified| (cand.clone(), verified.algo))
+    })
 }
 
 /// QQ's raw_key is 16 printable bytes used as the SQLCipher passphrase. Match
@@ -317,8 +316,6 @@ fn decrypt_all(
         .collect();
 
     use indicatif::{ProgressBar, ProgressStyle};
-    use rayon::prelude::*;
-
     let bar = ProgressBar::new(entries.len() as u64);
     bar.set_style(
         ProgressStyle::with_template(

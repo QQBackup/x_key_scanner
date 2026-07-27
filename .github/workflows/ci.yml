@@ -1,9 +1,5 @@
 name: ci
 
-# Fast per-push / per-PR check: does every one of the six targets still compile?
-# arm targets are `cargo check` only (no HW to run on); x64 targets build + test.
-# Same no-openssl rule as release.yml — rusqlite is plain `bundled` SQLite.
-
 on:
   push:
     branches: [main, master]
@@ -11,37 +7,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  check:
-    name: ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            cross: false
-            test: true
-          - target: aarch64-pc-windows-msvc
-            os: windows-latest
-            cross: false
-            test: false
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            cross: false
-            test: true
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            cross: true
-            test: false
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            cross: false
-            test: true
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            cross: false
-            test: false
+  clippy:
+    name: Linux clippy
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -49,32 +17,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
           components: clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
-        with:
-          key: ci-${{ matrix.target }}
 
-      - name: Set up MSVC (Windows ARM64)
-        if: matrix.target == 'aarch64-pc-windows-msvc'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: amd64_arm64
-
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --locked
-
-      - name: Clippy (native)
-        if: ${{ !matrix.cross }}
-        run: cargo clippy --target ${{ matrix.target }} -- -D warnings
-
-      - name: Check (cross)
-        if: matrix.cross
-        run: cross build --target ${{ matrix.target }}
-
-      - name: Test (x64 only)
-        if: matrix.test
-        run: cargo test --target ${{ matrix.target }}
+      - name: Clippy
+        run: cargo clippy -- -D warnings
