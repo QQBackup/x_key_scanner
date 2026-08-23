@@ -1,6 +1,7 @@
 //! Platform abstraction for the three privileged operations:
 //!   1. find the PID(s) that loaded `wrapper.node` (the QQ NT main process),
-//!   2. probe whether a given account is logged in (mutex / fcntl lock),
+//!   2. probe which processes hold an account's database files open (the
+//!      login-state probe),
 //!   3. read another process's memory regions.
 //!
 //! Each OS implements [`ProcessAccess`]; the rest of the app is OS-agnostic.
@@ -22,8 +23,11 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::PlatformAccess;
 
+mod db_lock;
+pub use db_lock::DbHolder;
+
 mod login_status;
-pub use login_status::is_account_logged_in;
+pub use login_status::{is_qq_process_name, probe_account_db_holders};
 
 /// A readable memory region in the target process.
 #[derive(Debug, Clone, Copy)]

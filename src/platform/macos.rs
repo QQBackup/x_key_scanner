@@ -74,6 +74,7 @@ unsafe extern "C" {
         buffersize: u32,
     ) -> libc::c_int;
     fn proc_pidpath(pid: libc::c_int, buffer: *mut libc::c_void, buffersize: u32) -> libc::c_int;
+    fn proc_name(pid: libc::c_int, buffer: *mut libc::c_void, buffersize: u32) -> libc::c_int;
 }
 
 // --- mach FFI (only for reading memory; needs root) ------------------------
@@ -156,6 +157,22 @@ fn pid_path(pid: libc::c_int) -> Option<String> {
     }
     buf.truncate(n as usize);
     String::from_utf8(buf).ok()
+}
+
+/// The process name of `pid` (one cheap libproc call). Used to identify the QQ
+/// process holding an account's database lock.
+pub fn process_name(pid: u32) -> Option<String> {
+    let mut buf = vec![0u8; MAXPATHLEN];
+    // SAFETY: buffer is MAXPATHLEN bytes; proc_name writes a NUL-terminated
+    // string and returns its length.
+    let n = unsafe {
+        proc_name(pid as libc::c_int, buf.as_mut_ptr() as *mut libc::c_void, MAXPATHLEN as u32)
+    };
+    if n <= 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(n as usize);
+    String::from_utf8(buf[..end].to_vec()).ok()
 }
 
 /// Enumerate PIDs that have `wrapper.node` mapped.
