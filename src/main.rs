@@ -4,6 +4,7 @@ mod login_db;
 mod platform;
 mod scan;
 mod ui;
+mod wal_merge;
 
 use std::collections::HashSet;
 use std::io::{self, Write};
@@ -13,7 +14,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use rayon::prelude::*;
 
-use crypto::{Algo, decrypt_database, detect_algo};
+use crypto::{Algo, detect_algo};
 use login_db::Account;
 use platform::{DbHolder, ProcessAccess};
 
@@ -370,14 +371,26 @@ fn wait_for_qq_to_exit(logged_in: &[LoggedInAccount]) -> io::Result<()> {
 /// Decrypt the global login.db into `out_dir/login.db`.
 fn decrypt_login_db(out_dir: &Path, login_db: &Path, login_algo: Algo) -> io::Result<()> {
     std::fs::create_dir_all(out_dir)?;
-    // login.db uses the built-in pre-login key + its own detected algo.
-    if let Ok(bytes) = std::fs::read(login_db) {
-        if let Some(plain) = decrypt_database(&bytes, b"BD156D6710D54D8782F4", &login_algo) {
-            std::fs::write(out_dir.join("login.db"), plain)?;
-            ui::ok("已解密 login.db");
-        }
+    // login.db uses the built-in pre-login key + its own detected algo, and its
+    // -wal has to be replayed with it: QQ keeps a long-lived WAL, so an account
+    // that signed in during this session can be in there and nowhere else.
+    let decrypted = wal_merge::decrypt_db_file(login_db, login_db::PRE_LOGIN_KEY, &login_algo)?;
+    std::fs::write(out_dir.join("login.db"), &decrypted.bytes)?;
+    ui::ok(&format!(
+        "已解密 login.db{}",
+        wal_suffix(decrypted.wal_frames).unwrap_or_default()
+    ));
+    if let Some(warning) = &decrypted.wal_warning {
+        ui::warn(&format!(
+            "login.db 的 -wal 未合并（输出为最近一次检查点的快照）：{warning}"
+        ));
     }
     Ok(())
+}
+
+/// "（含 -wal 的 N 帧）" when a log contributed frames, else `None`.
+fn wal_suffix(frames: usize) -> Option<String> {
+    (frames > 0).then(|| format!("（含 -wal 的 {frames} 帧）"))
 }
 
 /// Decrypt every `*.db` of one account's `nt_db` directory into `out_dir`,
@@ -412,32 +425,37 @@ fn decrypt_account_dbs(
         .progress_chars("██░"),
     );
 
-    let results: Vec<(PathBuf, bool)> = entries
+    let results: Vec<(PathBuf, Option<wal_merge::Decrypted>)> = entries
         .par_iter()
         .map(|src| {
             let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             bar.set_message(name);
-            let ok = (|| {
-                let bytes = std::fs::read(src).ok()?;
-                let plain = decrypt_database(&bytes, &pass, &algo)?;
+            let done = (|| {
+                let decrypted = wal_merge::decrypt_db_file(src, &pass, &algo).ok()?;
                 let name = src.file_name()?;
-                std::fs::write(out_dir.join(name), plain).ok()?;
-                Some(())
-            })()
-            .is_some();
+                std::fs::write(out_dir.join(name), &decrypted.bytes).ok()?;
+                Some(decrypted)
+            })();
             bar.inc(1);
-            (src.clone(), ok)
+            (src.clone(), done)
         })
         .collect();
 
     bar.finish_and_clear();
 
-    for (src, ok) in results {
+    for (src, done) in results {
         let name = src.file_name().unwrap_or_default().to_string_lossy();
-        if ok {
-            ui::ok(&format!("已解密 {name}"));
-        } else {
-            ui::warn(&format!("跳过 {name}（算法不匹配，或来自运行中 QQ 的损坏数据页）"));
+        match done {
+            Some(decrypted) => {
+                let suffix = wal_suffix(decrypted.wal_frames).unwrap_or_default();
+                ui::ok(&format!("已解密 {name}{suffix}"));
+                if let Some(warning) = &decrypted.wal_warning {
+                    ui::warn(&format!("{name} 的 -wal 未合并：{warning}"));
+                }
+            }
+            None => {
+                ui::warn(&format!("跳过 {name}（算法不匹配，或来自运行中 QQ 的损坏数据页）"));
+            }
         }
     }
     Ok(())

@@ -15,10 +15,11 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
 
-use crate::crypto::{Algo, decrypt_database, detect_algo};
+use crate::crypto::{Algo, detect_algo};
+use crate::wal_merge;
 
 /// Pre-login passphrase QQ NT bakes into the client, used to decrypt login.db.
-const PRE_LOGIN_KEY: &[u8] = b"BD156D6710D54D8782F4";
+pub const PRE_LOGIN_KEY: &[u8] = b"BD156D6710D54D8782F4";
 
 #[derive(Debug, Clone)]
 pub struct Account {
@@ -28,6 +29,9 @@ pub struct Account {
 }
 
 /// Decrypt `login.db` at `path` and return the cached accounts.
+///
+/// The `-wal` sidecar is replayed first when present: QQ keeps a long-lived
+/// WAL, so an account logged in during this session can live *only* there.
 ///
 /// Returns the detected algorithm alongside the accounts so callers can reuse it
 /// (the same client build tends to use the same pair everywhere).
@@ -40,11 +44,17 @@ pub fn read_accounts(path: &Path) -> io::Result<(Vec<Account>, Algo)> {
              the built-in pre-login key (client layout may have changed)",
         )
     })?;
-    let plain = decrypt_database(&bytes, PRE_LOGIN_KEY, &verified.algo).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "login.db decryption produced no output")
-    })?;
+    let merged = wal_merge::decrypt_db_bytes(
+        &bytes,
+        &wal_merge::wal_sidecar(path),
+        PRE_LOGIN_KEY,
+        &verified.algo,
+    )?;
+    if let Some(warning) = &merged.wal_warning {
+        crate::ui::warn(&format!("{}：{warning}", path.display()));
+    }
 
-    let accounts = query_login_table(&plain)?;
+    let accounts = query_login_table(&merged.bytes)?;
     Ok((accounts, verified.algo))
 }
 

@@ -32,6 +32,11 @@ pub const FAST_ITER: u32 = 2;
 /// SQLCipher's HMAC-salt mask: the HMAC-key salt = page salt XOR 0x3a.
 pub const HMAC_MASK: u8 = 0x3a;
 
+/// SQLite WAL header: magic, format version, page size, salt, checksum.
+pub const WAL_HDR_SIZE: usize = 32;
+/// SQLite WAL frame header: page number, commit size, salt, checksum.
+pub const WAL_FRAME_HDR_SIZE: usize = 24;
+
 /// Derive the 32-byte AES key from a passphrase + the DB's page-1 salt.
 pub fn derive_key(passphrase: &[u8], salt: &[u8], algo: &Algo) -> [u8; KEY_SIZE] {
     let mut key = [0u8; KEY_SIZE];
@@ -109,7 +114,11 @@ pub fn verify_key(db_bytes: &[u8], passphrase: &[u8], algo: &Algo) -> Option<[u8
     let stored = &page1[data_end + IV_SIZE..data_end + IV_SIZE + hmac_size];
 
     let matches = computed.len() == hmac_size
-        && computed.iter().zip(stored).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+        && computed
+            .iter()
+            .zip(stored)
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
     matches.then_some(key)
 }
 
@@ -141,7 +150,9 @@ pub fn detect_algo(db_bytes: &[u8], passphrase: &[u8]) -> Option<Verified> {
 /// (use [`detect_algo`] first). Page 1 gets a fresh SQLite header written so the
 /// output is a standalone, openable SQLite file.
 pub fn decrypt_database(db_bytes: &[u8], passphrase: &[u8], algo: &Algo) -> Option<Vec<u8>> {
-    if db_bytes.len() <= EXT_HEADER + PAGE_SIZE {
+    // A database whose pages all live in the `-wal` sidecar still has a valid
+    // page 1 (SQLite always writes it), so one page is enough to be a base.
+    if db_bytes.len() < EXT_HEADER + PAGE_SIZE {
         return None;
     }
     let sc = &db_bytes[EXT_HEADER..];
@@ -156,23 +167,216 @@ pub fn decrypt_database(db_bytes: &[u8], passphrase: &[u8], algo: &Algo) -> Opti
         let page = &sc[off..off + PAGE_SIZE];
         let skip = if page_num == 1 { SALT_SIZE } else { 0 };
         let dec = decrypt_page(page, &key, skip, reserve)?;
-
-        if page_num == 1 {
-            let mut full = vec![0u8; PAGE_SIZE];
-            full[..16].copy_from_slice(b"SQLite format 3\0");
-            let n = dec.len().min(PAGE_SIZE - 16);
-            full[16..16 + n].copy_from_slice(&dec[..n]);
-            // Fix page-size field (offset 16..18, big-endian).
-            full[16] = (PAGE_SIZE >> 8) as u8;
-            full[17] = (PAGE_SIZE & 0xff) as u8;
-            out.extend_from_slice(&full);
-        } else {
-            out.extend_from_slice(&dec);
-            let pad = PAGE_SIZE - (out.len() % PAGE_SIZE);
-            if pad < PAGE_SIZE {
-                out.extend(std::iter::repeat_n(0u8, pad));
-            }
-        }
+        out.extend_from_slice(&plaintext_page(page_num as u32, &dec));
     }
     Some(out)
+}
+
+/// Build the plaintext image of one page from its decrypted body.
+///
+/// Page 1 is special in both the main file and the WAL: its first 16 on-disk
+/// bytes hold the salt, replacing the plaintext `"SQLite format 3\0"` magic.
+/// The encrypted body therefore starts at page offset 16 and the page-size
+/// field has to be restored. Every other page's body starts at offset 0.
+fn plaintext_page(page_num: u32, body: &[u8]) -> Vec<u8> {
+    let mut full = vec![0u8; PAGE_SIZE];
+    if page_num == 1 {
+        full[..16].copy_from_slice(b"SQLite format 3\0");
+        let n = body.len().min(PAGE_SIZE - 16);
+        full[16..16 + n].copy_from_slice(&body[..n]);
+        full[16] = (PAGE_SIZE >> 8) as u8;
+        full[17] = (PAGE_SIZE & 0xff) as u8;
+    } else {
+        let n = body.len().min(PAGE_SIZE);
+        full[..n].copy_from_slice(&body[..n]);
+    }
+    full
+}
+
+/// SQLite's rolling WAL checksum: two 32-bit accumulators advanced over 8-byte
+/// word pairs. `little_endian` is fixed by the WAL magic (`0x377f0682` =
+/// little, `0x377f0683` = big) and is otherwise unrelated to the host's byte
+/// order.
+///
+/// Every input length used here is a multiple of 8: the WAL header contributes
+/// 24 bytes, a frame its first 8 header bytes plus a whole page.
+fn wal_checksum(seed: [u32; 2], chunks: [&[u8]; 2], little_endian: bool) -> [u32; 2] {
+    let word = |b: &[u8]| -> u32 {
+        let b: [u8; 4] = b.try_into().expect("checksum runs on whole words");
+        if little_endian {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        }
+    };
+    let mut s = seed;
+    for src in chunks {
+        for pair in src.chunks_exact(8) {
+            let (w0, w1) = (word(&pair[..4]), word(&pair[4..]));
+            s[0] = s[0].wrapping_add(w0).wrapping_add(s[1]);
+            s[1] = s[1].wrapping_add(w1).wrapping_add(s[0]);
+        }
+    }
+    s
+}
+
+fn be_u32(bytes: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(bytes.try_into().ok()?))
+}
+
+/// Decrypt the `-wal` sidecar belonging to the database in `db_bytes`.
+///
+/// A WAL is *not* wrapped in SQLCipher's envelope the way the main file is: its
+/// 32-byte header and every 24-byte frame header stay plaintext, and each frame
+/// carries one encrypted page — page 1 keeping its 16-byte salt prefix, exactly
+/// like the main file. The AES key is the main database's (derived from the
+/// salt stored in page 1), so a single passphrase covers both files.
+///
+/// SQLite's frame checksums are computed over the frame *as stored*, i.e. over
+/// the ciphertext. Decrypting the pages therefore invalidates them, so we
+/// rebuild the whole rolling chain over the plaintext pages — hand a replayed
+/// log with the original checksums to SQLite and it treats every frame as torn
+/// and silently drops the data.
+///
+/// Only the intact prefix is kept (validation stops at the first checksum
+/// mismatch, mirroring SQLite's own recovery), which stops a WAL captured from
+/// a live QQ from contributing half-written pages.
+///
+/// Returns `None` when there is nothing usable to replay: unknown magic, a page
+/// size that isn't the 4096 we decrypt, a broken header checksum, or a first
+/// frame that doesn't verify.
+pub fn decrypt_wal(db_bytes: &[u8], wal: &[u8], passphrase: &[u8], algo: &Algo) -> Option<Vec<u8>> {
+    let page1 = read_page1(db_bytes)?;
+    let salt = &page1[..SALT_SIZE];
+    let key = derive_key(passphrase, salt, algo);
+    let reserve = algo.page.reserve();
+
+    let magic = be_u32(wal.get(0..4)?)?;
+    let little_endian = match magic {
+        0x377f_0682 => true,
+        0x377f_0683 => false,
+        _ => return None,
+    };
+    // 1 is SQLite's encoding of a 65536-byte page, which we can't decrypt.
+    if be_u32(wal.get(8..12)?)? as usize != PAGE_SIZE {
+        return None;
+    }
+
+    let hdr = wal.get(..WAL_HDR_SIZE)?;
+    let hdr_seed = wal_checksum([0, 0], [&hdr[..24], &[]], little_endian);
+    if hdr_seed != [be_u32(&hdr[24..28])?, be_u32(&hdr[28..32])?] {
+        return None;
+    }
+
+    let frame_size = WAL_FRAME_HDR_SIZE + PAGE_SIZE;
+    let frames = (wal.len() - WAL_HDR_SIZE) / frame_size;
+
+    // Pass 1: how much of the log is intact according to the stored, i.e.
+    // ciphertext, checksums?
+    let mut running = hdr_seed;
+    let mut intact = 0usize;
+    for i in 0..frames {
+        let off = WAL_HDR_SIZE + i * frame_size;
+        let fh = &wal[off..off + WAL_FRAME_HDR_SIZE];
+        let page = &wal[off + WAL_FRAME_HDR_SIZE..off + frame_size];
+        running = wal_checksum(running, [&fh[..8], page], little_endian);
+        if running != [be_u32(&fh[16..20])?, be_u32(&fh[20..24])?] {
+            break;
+        }
+        intact += 1;
+    }
+    if intact == 0 {
+        return None;
+    }
+
+    // Pass 2: decrypt the pages and redo the chain over the plaintext ones. The
+    // header is copied verbatim — nothing in it changes, so its checksum stays
+    // valid.
+    let mut out = Vec::with_capacity(WAL_HDR_SIZE + intact * frame_size);
+    out.extend_from_slice(hdr);
+    let mut running = hdr_seed;
+    for i in 0..intact {
+        let off = WAL_HDR_SIZE + i * frame_size;
+        let fh = &wal[off..off + WAL_FRAME_HDR_SIZE];
+        let page = &wal[off + WAL_FRAME_HDR_SIZE..off + frame_size];
+
+        let page_num = be_u32(&fh[..4])?;
+        let skip = if page_num == 1 { SALT_SIZE } else { 0 };
+        let body = decrypt_page(page, &key, skip, reserve)?;
+        let plain = plaintext_page(page_num, &body);
+
+        let mut new_hdr = [0u8; WAL_FRAME_HDR_SIZE];
+        new_hdr.copy_from_slice(fh);
+        running = wal_checksum(running, [&new_hdr[..8], &plain], little_endian);
+        new_hdr[16..20].copy_from_slice(&running[0].to_be_bytes());
+        new_hdr[20..24].copy_from_slice(&running[1].to_be_bytes());
+
+        out.extend_from_slice(&new_hdr);
+        out.extend_from_slice(&plain);
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// The running checksum has to be byte-identical to SQLite's, or every
+    /// frame we hand back looks torn. Generate a real WAL and check both the
+    /// header and each frame — this pins the word order (magic `0x377f0682`
+    /// means little-endian words on any host) and the 8-byte stride.
+    #[test]
+    fn wal_checksum_matches_sqlite() {
+        let dir = std::env::temp_dir().join(format!("x_key_scanner_cksum_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+        let _ = std::fs::remove_file(&db);
+        let mut wal_path = db.as_os_str().to_os_string();
+        wal_path.push("-wal");
+        let wal_path = PathBuf::from(wal_path);
+
+        // Keep the connection open: closing the last one checkpoints and
+        // deletes the WAL we want to inspect.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(x);",
+        )
+        .unwrap();
+        for i in 0..64 {
+            conn.execute("INSERT INTO t VALUES (?1)", [i]).unwrap();
+        }
+        let wal = std::fs::read(&wal_path).unwrap();
+        drop(conn);
+
+        let little_endian = match u32::from_be_bytes(wal[..4].try_into().unwrap()) {
+            0x377f_0682 => true,
+            0x377f_0683 => false,
+            magic => panic!("unexpected WAL magic {magic:#x}"),
+        };
+        let mut running = wal_checksum([0, 0], [&wal[..24], &[]], little_endian);
+        assert_eq!(
+            running,
+            [be_u32(&wal[24..28]).unwrap(), be_u32(&wal[28..32]).unwrap()],
+            "wal header checksum"
+        );
+
+        let page_size = u32::from_be_bytes(wal[8..12].try_into().unwrap()) as usize;
+        let frame = WAL_FRAME_HDR_SIZE + page_size;
+        let frames = (wal.len() - WAL_HDR_SIZE) / frame;
+        assert!(frames > 0, "the inserts should have produced WAL frames");
+        for i in 0..frames {
+            let off = WAL_HDR_SIZE + i * frame;
+            let fh = &wal[off..off + WAL_FRAME_HDR_SIZE];
+            let page = &wal[off + WAL_FRAME_HDR_SIZE..off + frame];
+            running = wal_checksum(running, [&fh[..8], page], little_endian);
+            assert_eq!(
+                running,
+                [be_u32(&fh[16..20]).unwrap(), be_u32(&fh[20..24]).unwrap()],
+                "frame {} checksum",
+                i + 1
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
