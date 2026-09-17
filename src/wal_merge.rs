@@ -221,13 +221,32 @@ mod tests {
         out
     }
 
+    /// The `login.db` candidates of the QQ data root the environment points at.
+    ///
+    /// These tests need real QQ data, so they are opt-in:
+    ///
+    /// ```text
+    /// X_KEY_SCANNER_QQ_DATA=$HOME/.config/QQ cargo test
+    /// ```
+    ///
+    /// Unset (CI, or a machine without QQ) means "nothing to check", which is
+    /// also why they must never guess at `HOME` — on a Windows runner it simply
+    /// isn't set.
+    fn local_login_dbs() -> Vec<PathBuf> {
+        let Some(root) = std::env::var_os("X_KEY_SCANNER_QQ_DATA").map(PathBuf::from) else {
+            return Vec::new();
+        };
+        crate::locate::login_db_candidates(&root)
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect()
+    }
+
     #[test]
     fn real_login_db_merges_its_wal() {
-        let p =
-            PathBuf::from(std::env::var("HOME").unwrap()).join(".config/QQ/global/nt_db/login.db");
-        if !p.exists() {
+        let Some(p) = local_login_dbs().into_iter().next() else {
             return;
-        }
+        };
         let raw = std::fs::read(&p).unwrap();
         let algo = crate::crypto::detect_algo(&raw, PRE_LOGIN_KEY)
             .unwrap()
@@ -267,11 +286,11 @@ mod tests {
     /// its main file is a lone page 1, which used to make decryption fail.
     #[test]
     fn real_login_db_with_all_pages_in_the_wal() {
-        let p = PathBuf::from(std::env::var("HOME").unwrap())
-            .join(".config/QQ/nt_qq/global/nt_db/login.db");
-        if !p.exists() {
+        let Some(p) = local_login_dbs().into_iter().find(|p| {
+            std::fs::metadata(p).is_ok_and(|m| m.len() == (EXT_HEADER + PAGE_SIZE) as u64)
+        }) else {
             return;
-        }
+        };
         let raw = std::fs::read(&p).unwrap();
         let algo = crate::crypto::detect_algo(&raw, PRE_LOGIN_KEY)
             .unwrap()
@@ -280,11 +299,9 @@ mod tests {
         let merged = decrypt_db_file(&p, PRE_LOGIN_KEY, &algo).unwrap();
         assert_eq!(merged.wal_warning, None);
         assert_eq!(integrity(&merged.bytes), "ok");
-        if raw.len() == EXT_HEADER + PAGE_SIZE {
-            // A lone page 1 in the main file: every data page has to come from
-            // the log, and decryption used to bail out on exactly this shape.
-            assert!(merged.bytes.len() > EXT_HEADER + PAGE_SIZE);
-        }
+        // Every data page has to come from the log — decryption used to bail
+        // out on exactly this shape.
+        assert!(merged.bytes.len() > EXT_HEADER + PAGE_SIZE);
         // The schema (and everything else) is only reachable through the log.
         let _ = read_accounts(&p).expect("the wal must supply the tables");
     }
@@ -292,10 +309,7 @@ mod tests {
     /// Without a sidecar there is nothing to replay, and that is not an error.
     #[test]
     fn missing_wal_sidecar_keeps_the_plain_image() {
-        let Some(src) = crate::locate::login_db_candidates(&home())
-            .into_iter()
-            .find(|p| p.exists())
-        else {
+        let Some(src) = local_login_dbs().into_iter().next() else {
             return;
         };
         let raw = std::fs::read(&src).unwrap();
@@ -318,7 +332,7 @@ mod tests {
     /// intact prefix must still replay rather than the whole log being dropped.
     #[test]
     fn torn_wal_keeps_the_intact_prefix() {
-        let Some(src) = crate::locate::login_db_candidates(&home())
+        let Some(src) = local_login_dbs()
             .into_iter()
             .find(|p| wal_sidecar(p).exists())
         else {
@@ -364,7 +378,7 @@ mod tests {
     /// whoever opens the result later.
     #[test]
     fn output_image_is_self_contained() {
-        let Some(src) = crate::locate::login_db_candidates(&home())
+        let Some(src) = local_login_dbs()
             .into_iter()
             .find(|p| wal_sidecar(p).exists())
         else {
@@ -380,15 +394,5 @@ mod tests {
         let written = std::fs::read(dir.join("login.db")).unwrap();
         assert_eq!(integrity(&written), "ok");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The QQ data root this test runs against.
-    fn home() -> PathBuf {
-        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-        if home.join(".config/QQ").exists() {
-            home.join(".config/QQ")
-        } else {
-            home.join("Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ")
-        }
     }
 }

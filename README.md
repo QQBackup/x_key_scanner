@@ -92,3 +92,9 @@ sudo ./x_key_scanner --output ./plain --force
 ```sh
 cargo build --release
 ```
+
+测试默认只跑与机器无关的部分。想拿**本机真实 QQ 数据**跑一遍解密 / 合并 `-wal` 的用例，把数据目录告诉它即可（不设则自动跳过，CI 里也不会碰这些用例）：
+
+```sh
+X_KEY_SCANNER_QQ_DATA="$HOME/.config/QQ" cargo test
+```
