@@ -19,12 +19,19 @@
 //!
 //! Regions are scanned in parallel with rayon to shrink the time window during
 //! which a live QQ can mutate the key material.
+//!
+//! The default (`Mode::Normal`) pass stops there. `Mode::Strong` additionally
+//! sweeps the whole region outward from the anchor band, testing every aligned
+//! window against settings.db and stopping the instant a candidate verifies.
+//! It trades time for robustness when the key has drifted far from the anchors.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
+use indicatif::ProgressBar;
 use rayon::prelude::*;
 
-use crate::platform::ProcessAccess;
+use crate::platform::{MemRegion, ProcessAccess};
 
 /// `\x09HMAC_SHA1` — length-prefixed marker sitting next to the key.
 const ANCHOR: &[u8] = &[0x09, b'H', b'M', b'A', b'C', b'_', b'S', b'H', b'A', b'1'];
@@ -33,6 +40,12 @@ const RADIUS: usize = 0x200;
 const KEY_LEN: usize = 16;
 /// Cap per-region read size so a pathological giant region can't OOM us.
 const MAX_REGION: usize = 512 * 1024 * 1024;
+/// Strong mode keeps at most this many candidates per region before giving up:
+/// a last-resort guard so a heap full of printable strings can't exhaust RAM.
+const STRONG_MAX_CANDIDATES: usize = 200_000;
+/// Strong mode verifies candidates in batches of this size so a wide outward
+/// sweep still uses every core (each verification is a PBKDF2 brute-force).
+const STRONG_VERIFY_BATCH: usize = 256;
 /// Anchors closer than this belong to the same cluster (codec-context band).
 const CLUSTER_GAP: usize = 0x4000;
 /// A cluster must hold at least this many anchors to be trusted as a codec band
@@ -193,33 +206,96 @@ pub struct Candidate {
     pub count: usize,
 }
 
+/// How aggressively to search for the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Anchor-adjacent search only, plus the densest-cluster fallback. Fast.
+    Normal,
+    /// Additionally sweep every aligned window of every region — starting at
+    /// the anchor band and wrapping around — verifying on the fly and stopping
+    /// the instant a key validates.
+    Strong,
+}
+
+/// Everything a scan produced. `verified` is the first candidate that matched
+/// `settings.db` (what callers actually need); `candidates` is the ranked list
+/// used for reporting when nothing verified.
+pub struct ScanOutcome {
+    pub candidates: Vec<Candidate>,
+    pub verified: Option<Candidate>,
+}
+
+/// Read a whole region, honoring the per-region cap.
+fn read_capped<A: ProcessAccess + Sync>(access: &A, region: &MemRegion) -> Vec<u8> {
+    let size = region.size.min(MAX_REGION);
+    // Unreadable regions are skipped, not fatal.
+    access.read(region.base, size).unwrap_or_default()
+}
+
+/// If the batch carries candidates and one of them verifies, return the first
+/// match (in batched order). `verify` returns the algo on success.
+fn verify_batch(
+    batch: &[[u8; KEY_LEN]],
+    verify: &(impl Fn(&[u8; KEY_LEN]) -> bool + Sync),
+) -> Option<[u8; KEY_LEN]> {
+    batch.par_iter().find_map_any(|k| verify(k).then_some(*k))
+}
+
+/// Apply `verify` to a bare key. A named helper keeps the closure types readable
+/// at call sites and gives tests one place to stub verification.
+fn verify_key(verify: &(impl Fn(&[u8; KEY_LEN]) -> bool + Sync), key: &[u8; KEY_LEN]) -> bool {
+    verify(key)
+}
+
 /// Scan the process's readable regions for raw_key candidates. Candidates with
 /// more character classes rank first, then more frequently observed candidates.
-pub fn scan<A: ProcessAccess + Sync>(access: &A) -> std::io::Result<Vec<Candidate>> {
+///
+/// `verify` is called on candidates; the moment one verifies the scan returns
+/// it (both modes). `progress` (optional) drives a UI progress bar incremented by
+/// bytes read. Strong mode additionally sweeps every aligned window of every
+/// region (starting at the anchor band) until a verifying key turns up.
+pub fn scan<A, F>(
+    access: &A,
+    mode: Mode,
+    verify: F,
+    progress: Option<&ProgressBar>,
+) -> std::io::Result<ScanOutcome>
+where
+    A: ProcessAccess + Sync,
+    F: Fn(&[u8; KEY_LEN]) -> bool + Sync,
+{
     let regions = access.regions()?;
+    let strong = mode == Mode::Strong;
+    // Strong mode reads every region twice (cheap anchor pass, then the outward
+    // sweep), so its progress bar spans two byte-lengths' worth of work.
+    if let Some(bar) = progress {
+        let bytes: u64 = regions.iter().map(|r| r.size.min(MAX_REGION) as u64).sum();
+        bar.set_length(if strong { bytes * 2 } else { bytes });
+    }
 
-    // Each region independently yields a list of candidate keys; merge after.
+    // Phase 1: read each region once, collect anchor-adjacent and cluster-center
+    // candidates (both cheap). Regions run in parallel; every read ticks progress.
     let per_region: Vec<Vec<[u8; KEY_LEN]>> = regions
         .par_iter()
         .map(|region| {
-            let size = region.size.min(MAX_REGION);
-            let data = match access.read(region.base, size) {
-                Ok(d) => d,
-                Err(_) => return Vec::new(), // unreadable region: skip, not fatal
-            };
+            let data = read_capped(access, region);
+            if let Some(bar) = progress {
+                bar.inc(data.len() as u64);
+            }
+            if data.is_empty() {
+                return Vec::new();
+            }
             // Quick reject: no anchor at all (memmem's SIMD scan returns empty).
             let anchors = find_anchors(&data);
             if anchors.is_empty() {
                 return Vec::new();
             }
             let mut found = Vec::new();
-            // Native path: key sits beside a single anchor.
             for &anchor in &anchors {
                 if let Some(k) = nearest_key(&data, anchor) {
                     found.push(k);
                 }
             }
-            // Electron fallback: key sits near the densest cluster's center.
             found.extend(cluster_keys(&data, &anchors));
             found
         })
@@ -232,10 +308,103 @@ pub fn scan<A: ProcessAccess + Sync>(access: &A) -> std::io::Result<Vec<Candidat
         }
     }
 
-    let mut cands: Vec<Candidate> =
+    let mut candidates: Vec<Candidate> =
         counts.into_iter().map(|(key, count)| Candidate { key, count }).collect();
-    sort_candidates(&mut cands);
-    Ok(cands)
+    sort_candidates(&mut candidates);
+
+    // Verify the ranked pool. Normal mode stops here; Strong continues if none hit.
+    let verified = candidates
+        .par_iter()
+        .find_map_first(|c| verify_key(&verify, &c.key).then(|| c.clone()));
+    if verified.is_some() || !strong {
+        return Ok(ScanOutcome { candidates, verified });
+    }
+
+    // Phase 2 (Strong): sweep every aligned window of every region, starting at
+    // the anchor band. Verification happens on the fly inside each region, so we
+    // stop the instant a key validates. The shared "seen" set — seeded with the
+    // phase-1 pool — keeps rejected candidates from being re-tested.
+    let seen: Mutex<HashSet<[u8; KEY_LEN]>> =
+        Mutex::new(candidates.iter().map(|c| c.key).collect());
+    let found = regions.par_iter().find_map_any(|region| {
+        let data = read_capped(access, region);
+        if let Some(bar) = progress {
+            bar.inc(data.len() as u64);
+        }
+        if data.is_empty() {
+            return None;
+        }
+        strong_region_data(&data, &seen, &verify)
+    });
+
+    if let Some(key) = found {
+        let candidate = Candidate { key, count: 1 };
+        candidates.push(candidate.clone());
+        sort_candidates(&mut candidates);
+        return Ok(ScanOutcome { candidates, verified: Some(candidate) });
+    }
+    Ok(ScanOutcome { candidates, verified: None })
+}
+
+/// The pure-data half of Strong mode: sweep every aligned 16-byte window in one
+/// region, starting at the first anchor so nearby windows are tested first, and
+/// verify on the fly. Returns the first key that validates. With no anchors the
+/// sweep still covers the whole region from offset 0, so a key with no codec
+/// marker beside it is still reachable.
+fn strong_region_data(
+    data: &[u8],
+    seen: &Mutex<HashSet<[u8; KEY_LEN]>>,
+    verify: &(impl Fn(&[u8; KEY_LEN]) -> bool + Sync),
+) -> Option<[u8; KEY_LEN]> {
+    let n = data.len();
+    if n < KEY_LEN {
+        return None;
+    }
+    // A linear sweep visits each offset once; `seen` still dedupes keys shared
+    // with phase 1 across regions. We start at the first anchor (nearby windows
+    // verified first) and wrap around so the whole region is still covered.
+    let start = find_anchors(data).first().map(|&a| (a / ALIGN) * ALIGN).unwrap_or(0);
+
+    let mut batch: Vec<[u8; KEY_LEN]> = Vec::with_capacity(STRONG_VERIFY_BATCH);
+    let mut tested = 0usize;
+    let first_end = n - KEY_LEN + 1;
+    // Step each range separately so alignment never drifts across the wrap.
+    let offsets = (start..first_end).step_by(ALIGN).chain((0..start).step_by(ALIGN));
+    for off in offsets {
+        let window = &data[off..off + KEY_LEN];
+        if key_ok(window) {
+            let mut k = [0u8; KEY_LEN];
+            k.copy_from_slice(window);
+            batch.push(k);
+        }
+        if batch.len() >= STRONG_VERIFY_BATCH {
+            if let Some(found) = drain_and_verify(&mut batch, seen, verify) {
+                return Some(found);
+            }
+            tested += STRONG_VERIFY_BATCH;
+            if tested >= STRONG_MAX_CANDIDATES {
+                return None;
+            }
+        }
+    }
+    drain_and_verify(&mut batch, seen, verify)
+}
+
+/// Deduplicate a batch against `seen`, verify the fresh keys in parallel, and
+/// clear the batch. Returns the first key that verifies, if any.
+fn drain_and_verify(
+    batch: &mut Vec<[u8; KEY_LEN]>,
+    seen: &Mutex<HashSet<[u8; KEY_LEN]>>,
+    verify: &(impl Fn(&[u8; KEY_LEN]) -> bool + Sync),
+) -> Option<[u8; KEY_LEN]> {
+    if batch.is_empty() {
+        return None;
+    }
+    let fresh: Vec<[u8; KEY_LEN]> = {
+        let mut seen = seen.lock().unwrap();
+        batch.drain(..).filter(|k| seen.insert(*k)).collect()
+    };
+    verify_batch(&fresh, verify)
 }
 
 #[cfg(test)]
@@ -262,6 +431,12 @@ mod tests {
         }
     }
 
+    /// Normal-mode scan whose verifier rejects everything, so the returned
+    /// candidate list is exactly what the anchor/cluster paths collected.
+    fn scan_candidates(acc: &FakeAccess) -> Vec<Candidate> {
+        scan(acc, Mode::Normal, |_| false, None).unwrap().candidates
+    }
+
     /// Write the length-prefixed `\x09HMAC_SHA1` marker so its aligned slot passes
     /// `find_anchors` (which matches the anchor at slot+1).
     fn put_anchor(buf: &mut [u8], slot: usize) {
@@ -280,7 +455,7 @@ mod tests {
         buf[anchor + 0x100..anchor + 0x100 + KEY_LEN].copy_from_slice(&key);
 
         let acc = FakeAccess { base: 0x10000, data: buf };
-        let cands = scan(&acc).unwrap();
+        let cands = scan_candidates(&acc);
         assert!(cands.iter().any(|c| c.key == key), "native key must be found");
     }
 
@@ -319,7 +494,7 @@ mod tests {
         buf[decoy_pos..decoy_pos + KEY_LEN].copy_from_slice(&decoy);
 
         let acc = FakeAccess { base: 0x100000, data: buf };
-        let cands = scan(&acc).unwrap();
+        let cands = scan_candidates(&acc);
 
         assert!(
             cands.iter().any(|c| c.key == real),
@@ -358,11 +533,39 @@ mod tests {
         buf[key_off..key_off + KEY_LEN].copy_from_slice(&key);
 
         let acc = FakeAccess { base: 0x10000, data: buf };
-        let cands = scan(&acc).unwrap();
+        let cands = scan_candidates(&acc);
         assert!(
             cands.iter().any(|c| c.key == key),
             "cluster search must continue past large printable string tables"
         );
+    }
+
+    #[test]
+    fn strong_mode_sweeps_far_from_anchors() {
+        // A key beyond every Normal-mode reach (RADIUS and CLUSTER_MAX_OUT), yet
+        // still inside the region. Strong mode must sweep out and find it.
+        let mut buf = vec![0x00u8; 0x100000];
+        let anchor = 0x1000;
+        put_anchor(&mut buf, anchor);
+        let key = *b"strongKEY!@#$%^&";
+        let key_pos: usize = 0x80000;
+        assert!(key_pos.abs_diff(anchor) > CLUSTER_MAX_OUT);
+        buf[key_pos..key_pos + KEY_LEN].copy_from_slice(&key);
+
+        let acc = FakeAccess { base: 0x10000, data: buf };
+        // Normal mode cannot reach it.
+        let normal = scan_candidates(&acc);
+        assert!(!normal.iter().any(|c| c.key == key));
+
+        // Strong mode verifies candidates on the fly and returns the key.
+        let outcome = scan(
+            &acc,
+            Mode::Strong,
+            |k| *k == key,
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.verified.map(|c| c.key), Some(key));
     }
 
     #[test]

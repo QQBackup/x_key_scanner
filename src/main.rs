@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
 use crypto::{Algo, detect_algo};
@@ -44,6 +45,12 @@ struct Cli {
     /// 立即解密（对运行中的数据库解密可能得到损坏的数据页）。
     #[arg(long)]
     force: bool,
+
+    /// 强力模式：默认只在 HMAC_SHA1 锚点附近查找密钥；加此参数后会从锚点
+    /// 出发向外扩散扫描整个区域的每一个 16 字节对齐窗口，直到找到验证通过
+    /// 的密钥或扫完全部区域。更慢，但当密钥已远离锚点时更可能成功。
+    #[arg(long)]
+    strong: bool,
 }
 
 fn main() -> ExitCode {
@@ -149,10 +156,37 @@ fn run(cli: &Cli) -> io::Result<ExitCode> {
 
     // --- Step 5: scan every pid concurrently ---------------------------------
     ui::section("内存扫描");
+    let mode = if cli.strong { scan::Mode::Strong } else { scan::Mode::Normal };
+    if cli.strong {
+        ui::info("强力模式：从锚点附近开始，扫描整个区域直到验证通过或扫完。");
+    }
+    // One stacked progress bar per account; each is advanced by bytes read, so
+    // it fills the same way whether we are in normal or strong mode.
+    let mp = MultiProgress::new();
+    let bars: Vec<ProgressBar> = logged_in
+        .iter()
+        .map(|li| {
+            let bar = mp.add(ProgressBar::new(0));
+            bar.set_style(
+                ProgressStyle::with_template(
+                    "  {spinner:.cyan} {msg:<22} [{bar:26.cyan/blue}] {bytes:>10}/{total_bytes:>10}",
+                )
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("█░"),
+            );
+            bar.set_message(format!("{} (uin {})", li.account.nick, li.account.uin));
+            bar
+        })
+        .collect();
     let results: Vec<ScanResult> = logged_in
         .par_iter()
-        .map(|li| scan_one(&root, li))
+        .zip(bars.par_iter())
+        .map(|(li, bar)| scan_one(&root, li, mode, Some(bar)))
         .collect();
+    for bar in &bars {
+        bar.finish_and_clear();
+    }
+    mp.clear().ok();
 
     // --- Step 6: aggregated results ------------------------------------------
     ui::section("结果");
@@ -261,7 +295,12 @@ fn detect_logged_in(
 
 /// Scan one logged-in account's process for the raw_key and verify the
 /// candidates against that account's settings.db.
-fn scan_one(root: &Path, li: &LoggedInAccount) -> ScanResult {
+fn scan_one(
+    root: &Path,
+    li: &LoggedInAccount,
+    mode: scan::Mode,
+    progress: Option<&ProgressBar>,
+) -> ScanResult {
     let db_dir = locate::account_db_dir(root, &li.account.uin, &li.account.uid);
     let mut out = ScanResult {
         account: li.account.clone(),
@@ -279,47 +318,39 @@ fn scan_one(root: &Path, li: &LoggedInAccount) -> ScanResult {
             return out;
         }
     };
-    let candidates = match scan::scan(&access) {
-        Ok(c) => c,
+    // settings.db is the ground truth: a candidate is only "the key" if it
+    // decrypts this file. Load it once and let the scanner test candidates live.
+    let settings_db = db_dir.join("settings.db");
+    let settings_bytes = std::fs::read(&settings_db).ok();
+    let verify = |key: &[u8; 16]| -> bool {
+        settings_bytes.as_ref().is_some_and(|bytes| detect_algo(bytes, key).is_some())
+    };
+    // Without settings.db there is nothing to verify against, so a strong-mode
+    // sweep could never succeed — don't waste the whole-memory pass on it.
+    let mode = if settings_bytes.is_some() { mode } else { scan::Mode::Normal };
+    let outcome = match scan::scan(&access, mode, verify, progress) {
+        Ok(o) => o,
         Err(e) => {
             out.error = Some(format!("内存扫描失败: {e}"));
             return out;
         }
     };
-    out.candidates = candidates.len();
-    if candidates.is_empty() {
+    out.candidates = outcome.candidates.len();
+    if outcome.candidates.is_empty() && outcome.verified.is_none() {
         out.error = Some("内存扫描未在 HMAC_SHA1 锚点附近找到任何 raw_key 候选".to_string());
         return out;
     }
-    out.top_candidates = candidates.iter().take(5).cloned().collect();
-    let settings_db = db_dir.join("settings.db");
-    out.verified = verify_against_settings(&settings_db, &candidates);
+    out.top_candidates = outcome.candidates.iter().take(5).cloned().collect();
+    out.verified = outcome.verified.and_then(|cand| {
+        let algo = settings_bytes.as_ref().and_then(|bytes| detect_algo(bytes, &cand.key))?;
+        Some((cand, algo.algo))
+    });
     if out.verified.is_none() {
         out.error = Some(
             "无法用 settings.db 验证任何候选（文件缺失，或 QQ 在内存中改动了密钥）".to_string(),
         );
     }
     out
-}
-
-/// Try each raw_key candidate against settings.db, brute-forcing the algorithm
-/// pair. Candidate checks run in parallel, while `find_map_first` preserves the
-/// scanner's character-class and frequency priority.
-fn verify_against_settings(
-    settings_db: &Path,
-    candidates: &[scan::Candidate],
-) -> Option<(scan::Candidate, Algo)> {
-    let bytes = std::fs::read(settings_db).ok()?;
-    candidates.par_iter().find_map_first(|cand| {
-        let pass = hex_passphrase(&cand.key);
-        detect_algo(&bytes, &pass).map(|verified| (cand.clone(), verified.algo))
-    })
-}
-
-/// QQ's raw_key is 16 printable bytes used as the SQLCipher passphrase. Match
-/// the reference: pass the bytes through verbatim (the KDF salts + stretches).
-fn hex_passphrase(key: &[u8; 16]) -> Vec<u8> {
-    key.to_vec()
 }
 
 /// Whether any of the given QQ pids is still alive — re-enumerates the
