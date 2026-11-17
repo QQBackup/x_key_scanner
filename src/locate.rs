@@ -75,27 +75,65 @@ pub fn account_hash(uid: &str) -> String {
 /// Detect the QQ data root for the current platform. Returns `None` if it can't
 /// be determined (the caller should then fall back to manual input).
 pub fn detect_data_root() -> Option<PathBuf> {
+    let candidates = detect_data_root_candidates();
+    candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
+/// Candidate data roots, most-preferred first.
+///
+/// Windows can have several (the ini may point elsewhere than the default
+/// locations), so callers should take the first that exists rather than
+/// trusting a single guess. Other platforms have exactly one.
+pub fn detect_data_root_candidates() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
-        detect_windows_root()
+        windows_root_candidates()
     }
     #[cfg(target_os = "linux")]
     {
-        linux_config_qq()
+        linux_config_qq().into_iter().collect()
     }
     #[cfg(target_os = "macos")]
     {
-        Some(
-            home_dir()?
-                .join("Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ"),
-        )
+        home_dir()
+            .map(|h| {
+                vec![
+                    h.join("Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ"),
+                ]
+            })
+            .unwrap_or_default()
     }
 }
 
+/// What `[UserDataSet]` in `UserDataInfo.ini` says about the data root.
 #[cfg(windows)]
-fn detect_windows_root() -> Option<PathBuf> {
-    const INI: &str = r"C:\Users\Public\Documents\Tencent\QQ\UserDataInfo.ini";
-    let text = std::fs::read_to_string(INI).ok()?;
+struct UserDataInfo {
+    /// `UserDataSavePathType`: `2` = honor `UserDataSavePath`, `1` =
+    /// `Documents/Tencent Files`, anything else (0, 3, unknown, missing) =
+    /// the legacy `Documents/QQ` layout.
+    save_path_type: Option<i64>,
+    /// `UserDataSavePath` as written, without interpreting the type.
+    save_path: Option<String>,
+}
+
+/// Parse `%PUBLIC%\Documents\Tencent\QQ\UserDataInfo.ini` (i.e. `Public` next
+/// to the user's home). Returns `None` when the file is missing/unreadable.
+#[cfg(windows)]
+fn read_user_data_info(home: &Path) -> Option<UserDataInfo> {
+    let ini = home
+        .parent()?
+        .join("Public")
+        .join("Documents")
+        .join("Tencent")
+        .join("QQ")
+        .join("UserDataInfo.ini");
+    let text = std::fs::read_to_string(ini).ok()?;
+
+    let mut info = UserDataInfo { save_path_type: None, save_path: None };
     let mut in_section = false;
     for line in text.lines() {
         let line = line.trim();
@@ -103,34 +141,83 @@ fn detect_windows_root() -> Option<PathBuf> {
             in_section = line.eq_ignore_ascii_case("[UserDataSet]");
             continue;
         }
-        if in_section {
-            // Match the exact key. Note `UserDataSavePathType=...` shares a
-            // prefix, so we key on "UserDataSavePath=" (with the '='), and also
-            // tolerate stray spaces around it.
-            let stripped = line
-                .split_once('=')
-                .filter(|(k, _)| k.trim().eq_ignore_ascii_case("UserDataSavePath"))
-                .map(|(_, v)| v.trim());
-            if let Some(val) = stripped {
-                if !val.is_empty() {
-                    // UserDataSavePath already points AT the data root, which is
-                    // the "Tencent Files" folder itself. Only append the folder
-                    // if this install's value stops one level short.
-                    let p = PathBuf::from(val);
-                    if p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("Tencent Files")) {
-                        return Some(p);
-                    }
-                    return Some(p.join("Tencent Files"));
-                }
+        if !in_section {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let key = key.trim();
+        let value = value.trim();
+        if key.eq_ignore_ascii_case("UserDataSavePath") {
+            if !value.is_empty() {
+                info.save_path = Some(value.to_string());
             }
+        } else if key.eq_ignore_ascii_case("UserDataSavePathType") {
+            info.save_path_type = value.parse::<i64>().ok();
         }
     }
-    None
+    Some(info)
+}
+
+/// Windows data-root candidates in the order QQ itself would consider them.
+///
+/// `UserDataSavePathType` decides which directory QQ actually uses:
+///   * `2` → `UserDataSavePath` (custom location, e.g. data moved to `D:`)
+///   * `1` → `Documents/Tencent Files`
+///   * anything else → `Documents/QQ` (legacy NT layout / migrated installs)
+///
+/// QQ ignores `UserDataSavePath` unless the type is `2`. We still keep it as a
+/// lower-priority fallback: users who hand-edit the ini to point back at old
+/// data exist, and dropping the path entirely would strand them.
+#[cfg(windows)]
+fn windows_root_candidates() -> Vec<PathBuf> {
+    home_dir().map(|home| windows_root_candidates_for(&home)).unwrap_or_default()
+}
+
+/// `windows_root_candidates` with an explicit home — the testable half.
+#[cfg(windows)]
+fn windows_root_candidates_for(home: &Path) -> Vec<PathBuf> {
+    let info = read_user_data_info(home);
+    let save_path = info.as_ref().and_then(|i| i.save_path.as_deref()).map(PathBuf::from);
+    let save_path_type = info.as_ref().and_then(|i| i.save_path_type);
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if save_path_type == Some(2) {
+        roots.extend(save_path.clone());
+    }
+    roots.push(if save_path_type == Some(1) {
+        home.join("Documents").join("Tencent Files")
+    } else {
+        home.join("Documents").join("QQ")
+    });
+    if save_path_type != Some(2) {
+        roots.extend(save_path);
+    }
+    roots.push(home.join("Tencent Files"));
+    // Legacy admin profiles nest Documents one level deeper.
+    if let Ok(entries) = std::fs::read_dir(home) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.to_ascii_lowercase().starts_with("admin") {
+                continue;
+            }
+            let docs = entry.path().join("Documents");
+            roots.push(docs.join("Tencent Files"));
+            roots.push(docs.join("QQ"));
+        }
+    }
+    roots.dedup();
+    roots
 }
 
 #[cfg(unix)]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+}
+
+#[cfg(windows)]
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
 }
 
 /// Resolve `~/.config/QQ`, tolerating `sudo`. Under sudo `$HOME` is `/root`,
@@ -191,4 +278,88 @@ fn scan_home_config_qq() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    /// `<tmp>/case-N/home` 加同级的 `<tmp>/case-N/Public/.../UserDataInfo.ini`。
+    fn scratch(ini: Option<&str>) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "xks-locate-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        if let Some(text) = ini {
+            let dir = base.join("Public/Documents/Tencent/QQ");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("UserDataInfo.ini"), text).unwrap();
+        }
+        home
+    }
+
+    fn cleanup(home: &Path) {
+        if let Some(base) = home.parent() {
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+
+    /// `[UserDataSet]` 段 + 给定行，CRLF 换行（QQ 写的就是 CRLF）。
+    fn ini(body: &[&str]) -> String {
+        let mut lines = vec!["[UserDataSet]"];
+        lines.extend_from_slice(body);
+        lines.join("\r\n")
+    }
+
+    #[test]
+    fn save_path_type_2_puts_the_custom_path_first() {
+        let home = scratch(Some(&ini(&["UserDataSavePathType=2", r"UserDataSavePath=D:\data"])));
+        let roots = windows_root_candidates_for(&home);
+        assert_eq!(roots[0], PathBuf::from(r"D:\data"));
+        assert!(roots.contains(&home.join("Documents").join("QQ")));
+        cleanup(&home);
+    }
+
+    #[test]
+    fn save_path_type_1_uses_documents_tencent_files() {
+        let home = scratch(Some(&ini(&["UserDataSavePathType=1", r"UserDataSavePath=D:\data"])));
+        let roots = windows_root_candidates_for(&home);
+        assert_eq!(roots[0], home.join("Documents").join("Tencent Files"));
+        // QQ 忽略 savePath，但手改 ini 指回旧数据的用户仍要兜住。
+        assert!(roots.contains(&PathBuf::from(r"D:\data")));
+        cleanup(&home);
+    }
+
+    #[test]
+    fn other_types_and_missing_type_fall_back_to_documents_qq() {
+        for body in [
+            vec!["UserDataSavePathType=0", r"UserDataSavePath=D:\data"],
+            vec!["UserDataSavePathType=3", r"UserDataSavePath=D:\data"],
+            vec![r"UserDataSavePath=D:\data"],
+        ] {
+            let home = scratch(Some(&ini(&body)));
+            let roots = windows_root_candidates_for(&home);
+            assert_eq!(roots[0], home.join("Documents").join("QQ"), "ini={body:?}");
+            cleanup(&home);
+        }
+    }
+
+    #[test]
+    fn ignores_old_ver_data_path_from_the_import_section() {
+        let text = format!(
+            "[UserDataImportSet]\r\nOldVerDataPath=D:\\legacy\r\n{}",
+            ini(&["UserDataSavePathType=2", r"UserDataSavePath=D:\data"])
+        );
+        let home = scratch(Some(&text));
+        let roots = windows_root_candidates_for(&home);
+        assert_eq!(roots[0], PathBuf::from(r"D:\data"));
+        assert!(!roots.contains(&PathBuf::from(r"D:\legacy")));
+        cleanup(&home);
+    }
 }

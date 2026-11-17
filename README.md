@@ -73,7 +73,7 @@ sudo ./x_key_scanner --output ./plain --force
 
 ## 自动检测失败时
 
-工具会自动定位 QQ 数据目录。若失败，用 `--data-root` 手动指定（指向包含各账号目录的文件夹，Windows 上通常是 `.../Tencent Files`）：
+工具会自动定位 QQ 数据目录。Windows 上按 `UserDataInfo.ini` 的 `UserDataSavePathType` 判断真实位置：`2` 用其中记录的 `UserDataSavePath`，`1` 是 `文档/Tencent Files`，其余取值（含旧版与迁移安装）是 `文档/QQ`。若失败，用 `--data-root` 手动指定（指向包含各账号目录的文件夹）：
 
 ```sh
 ./x_key_scanner --data-root "/path/to/QQ"
