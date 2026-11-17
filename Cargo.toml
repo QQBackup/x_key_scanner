@@ -1,6 +1,6 @@
 [package]
 name = "x_key_scanner"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Non-invasively recover the NTQQ master key from a logged-in QQ process by scanning its memory."
